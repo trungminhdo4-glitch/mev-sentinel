@@ -1,0 +1,15 @@
+# MEV Sentinel Configuration
+
+[network]
+binance_ws = "wss://stream.binance.com:9443/ws/ethusdt@ticker"
+mainnet_rpc = "https://ethereum.publicnode.com"
+arbitrum_rpc = "https://arbitrum.publicnode.com"
+
+[pool]
+address = "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"
+fee_tier = 0.0005 # 0.05%
+
+[thresholds]
+critical_lvr_usd = 1.0
+stale_rpc_ms = 300
+vola_interval_sec = 2.0
