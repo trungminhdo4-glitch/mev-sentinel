@@ -57,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
     let (arbitrum_tx, mut arbitrum_rx) = watch::channel::<Option<ChainData>>(None);
 
     // ── Spawn data tasks ──────────────────────────────────────────────────
-    tokio::spawn(run_binance(cfg.network.binance_ws.clone(), binance_tx));
+    tokio::spawn(run_binance(cfg.network.clone(), binance_tx));
     tokio::spawn(run_chain_poller(client.clone(), cfg.chains.mainnet.clone(), mainnet_tx));
     tokio::spawn(run_chain_poller(client.clone(), cfg.chains.arbitrum.clone(), arbitrum_tx));
 
