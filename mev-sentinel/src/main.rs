@@ -41,7 +41,10 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Shared state ─────────────────────────────────────────────────────
     let ui_state = Arc::new(Mutex::new(UiState::new()));
-    let engine   = Arc::new(Mutex::new(QuantEngine::new(cfg.thresholds.vola_interval_sec)));
+    let engine = Arc::new(Mutex::new(QuantEngine::new(
+        cfg.thresholds.vola_interval_sec,
+        cfg.thresholds.critical_lvr_usd,
+    )));
 
     // ── Connection Pooling ────────────────────────────────────────────────
     let tls = native_tls::TlsConnector::new().expect("TLS init failed");
