@@ -68,9 +68,9 @@ impl PoolStats {
 
 pub struct QuantEngine {
     pub prices: VecDeque<f64>,
-    pub mainnet_last_dex:     f64,
+    pub mainnet_last_dex:     Option<f64>,
     pub mainnet_stale:        u32,
-    pub arbitrum_last_dex:    f64,
+    pub arbitrum_last_dex:    Option<f64>,
     pub arbitrum_stale:       u32,
     pub mainnet_prev_spread:  f64,
     pub arbitrum_prev_spread: f64,
@@ -83,9 +83,9 @@ impl QuantEngine {
     pub fn new(vola_interval_sec: f64) -> Self {
         Self {
             prices:               VecDeque::with_capacity(RING_CAPACITY),
-            mainnet_last_dex:     0.0,
+            mainnet_last_dex:     None,
             mainnet_stale:        0,
-            arbitrum_last_dex:    0.0,
+            arbitrum_last_dex:    None,
             arbitrum_stale:       0,
             mainnet_prev_spread:  0.0,
             arbitrum_prev_spread: 0.0,
@@ -136,7 +136,17 @@ impl QuantEngine {
         fee:      f64,
         gas_gwei: f64,
         l1_base_fee_gwei: f64, // For Arb heuristic
-    ) -> (f64, f64, FlowType) {
+    ) -> Option<(f64, f64, FlowType)> {
+        if !dex.is_finite()
+            || dex <= 0.0
+            || !ticker.best_bid.is_finite()
+            || ticker.best_bid <= 0.0
+            || !ticker.best_ask.is_finite()
+            || ticker.best_ask < ticker.best_bid
+        {
+            return None;
+        }
+
         // Spread vs Best Bid/Ask
         let (relevant_cex, spread) = if dex < ticker.best_bid {
             (ticker.best_bid, (ticker.best_bid - dex) / ticker.best_bid)
@@ -164,12 +174,12 @@ impl QuantEngine {
             (&mut self.arbitrum_last_dex, &mut self.arbitrum_stale, &mut self.arbitrum_prev_spread)
         };
 
-        if (*last_dex - dex).abs() < 0.01 {
+        if last_dex.is_some_and(|last| (last - dex).abs() < 0.01) {
             *stale += 1;
         } else {
             *stale = 0;
         }
-        *last_dex = dex;
+        *last_dex = Some(dex);
 
         let jit = *stale >= 3 && (spread - *prev_spread).abs() > fee * 3.0;
         *prev_spread = spread;
@@ -184,6 +194,35 @@ impl QuantEngine {
             FlowType::Retail
         };
 
-        (spread, net_pnl, flow)
+        Some((spread, net_pnl, flow))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BinanceTicker, QuantEngine};
+
+    #[test]
+    fn invalid_dex_prices_are_not_classified_or_recorded() {
+        let mut engine = QuantEngine::new(2.0);
+        let ticker = BinanceTicker {
+            best_bid: 2_499.0,
+            best_ask: 2_501.0,
+            latency_ms: 10,
+        };
+
+        for price in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(engine
+                .classify("mainnet", ticker, price, 0.0005, 20.0, 0.0)
+                .is_none());
+        }
+
+        assert_eq!(engine.mainnet_last_dex, None);
+        assert_eq!(engine.mainnet_stale, 0);
+        assert_eq!(engine.mainnet_prev_spread, 0.0);
+
+        assert!(engine
+            .classify("mainnet", ticker, 2_500.0, 0.0005, 20.0, 0.0)
+            .is_some());
     }
 }

@@ -52,9 +52,9 @@ async fn main() -> anyhow::Result<()> {
         .expect("HTTP client build failed");
 
     // ── Watch channels ────────────────────────────────────────────────────
-    let (binance_tx, mut binance_rx)   = watch::channel(BinanceTicker::default());
-    let (mainnet_tx, mut mainnet_rx)   = watch::channel(ChainData::default());
-    let (arbitrum_tx, mut arbitrum_rx) = watch::channel(ChainData::default());
+    let (binance_tx, mut binance_rx) = watch::channel::<Option<BinanceTicker>>(None);
+    let (mainnet_tx, mut mainnet_rx) = watch::channel::<Option<ChainData>>(None);
+    let (arbitrum_tx, mut arbitrum_rx) = watch::channel::<Option<ChainData>>(None);
 
     // ── Spawn data tasks ──────────────────────────────────────────────────
     tokio::spawn(run_binance(cfg.network.binance_ws.clone(), binance_tx));
@@ -81,57 +81,108 @@ async fn main() -> anyhow::Result<()> {
                 let mn  = mainnet_rx.borrow().clone();
                 let arb = arbitrum_rx.borrow().clone();
                 // ... logic same ...
-                let rpc_lag = (mn.rpc_latency_ms + arb.rpc_latency_ms) / 2;
+                let rpc_lag = match (&mn, &arb) {
+                    (Some(mn), Some(arb)) => (mn.rpc_latency_ms + arb.rpc_latency_ms) / 2,
+                    (Some(mn), None) => mn.rpc_latency_ms,
+                    (None, Some(arb)) => arb.rpc_latency_ms,
+                    (None, None) => 0,
+                };
 
-                let (mn_spread, mn_pnl, mn_flow, arb_spread, arb_pnl, arb_flow, vol) = {
+                let (mn_result, arb_result, vol) = {
                     let mut eng = engine_agg.lock().unwrap();
-                    eng.push_price(ticker);
-                    eng.binance_latency_ms = ticker.latency_ms;
                     eng.rpc_latency_ms     = rpc_lag;
-                    
-                    let vol = eng.rolling_volatility();
-                    let (ms, mp, mf) = eng.classify("mainnet", ticker, mn.dex_price, cfg.pool.fee_tier, mn.gas_gwei, 0.0);
-                    let (as_, ap, af) = eng.classify("arbitrum", ticker, arb.dex_price, cfg.pool.fee_tier, arb.gas_gwei, mn.gas_gwei);
-                    (ms, mp, mf, as_, ap, af, vol)
+
+                    if let Some(ticker) = ticker {
+                        eng.push_price(ticker);
+                        eng.binance_latency_ms = ticker.latency_ms;
+
+                        let vol = eng.rolling_volatility();
+                        let mn_result = mn.as_ref().and_then(|data| {
+                            eng.classify(
+                                "mainnet",
+                                ticker,
+                                data.dex_price,
+                                cfg.pool.fee_tier,
+                                data.gas_gwei,
+                                0.0,
+                            )
+                        });
+                        let l1_base_fee_gwei = mn.as_ref().map_or(0.0, |data| data.gas_gwei);
+                        let arb_result = arb.as_ref().and_then(|data| {
+                            eng.classify(
+                                "arbitrum",
+                                ticker,
+                                data.dex_price,
+                                cfg.pool.fee_tier,
+                                data.gas_gwei,
+                                l1_base_fee_gwei,
+                            )
+                        });
+                        (mn_result, arb_result, vol)
+                    } else {
+                        (None, None, eng.rolling_volatility())
+                    }
                 };
 
                 let now = Local::now().format("%H:%M:%S").to_string();
                 {
                     let mut ui = ui_state_agg.lock().unwrap();
-                    ui.cex_price  = (ticker.best_bid + ticker.best_ask) / 2.0;
+                    if let Some(ticker) = ticker {
+                        ui.cex_price = (ticker.best_bid + ticker.best_ask) / 2.0;
+                        ui.binance_latency_ms = ticker.latency_ms;
+                    }
                     ui.volatility = vol;
-                    ui.binance_latency_ms = ticker.latency_ms;
                     ui.rpc_latency_ms     = rpc_lag;
 
-                    if mn_flow == FlowType::CriticalLvr || arb_flow == FlowType::CriticalLvr {
+                    if matches!(&mn_result, Some((_, _, FlowType::CriticalLvr)))
+                        || matches!(&arb_result, Some((_, _, FlowType::CriticalLvr)))
+                    {
                         let _ = io::stdout().write_all(b"\x07");
                         let _ = io::stdout().flush();
                     }
 
                     if rpc_lag <= stale_limit {
-                        if mn_pnl > 0.0 { ui.mainnet_stats.total_lvr_lost += mn_pnl; }
-                        if matches!(mn_flow, FlowType::CriticalLvr | FlowType::JitAttack) {
-                            ui.mainnet_stats.toxic_event_count += 1;
+                        if let Some((_, pnl, flow)) = &mn_result {
+                            if *pnl > 0.0 {
+                                ui.mainnet_stats.total_lvr_lost += *pnl;
+                            }
+                            if matches!(flow, FlowType::CriticalLvr | FlowType::JitAttack) {
+                                ui.mainnet_stats.toxic_event_count += 1;
+                            }
+                            ui.mainnet_stats.iterations += 1;
                         }
-                        ui.mainnet_stats.iterations += 1;
 
-                        if arb_pnl > 0.0 { ui.arbitrum_stats.total_lvr_lost += arb_pnl; }
-                        if matches!(arb_flow, FlowType::CriticalLvr | FlowType::JitAttack) {
-                            ui.arbitrum_stats.toxic_event_count += 1;
+                        if let Some((_, pnl, flow)) = &arb_result {
+                            if *pnl > 0.0 {
+                                ui.arbitrum_stats.total_lvr_lost += *pnl;
+                            }
+                            if matches!(flow, FlowType::CriticalLvr | FlowType::JitAttack) {
+                                ui.arbitrum_stats.toxic_event_count += 1;
+                            }
+                            ui.arbitrum_stats.iterations += 1;
                         }
-                        ui.arbitrum_stats.iterations += 1;
                     }
 
-                    ui.push_mainnet(ChainSnapshot {
-                        time: now.clone(), dex_price: mn.dex_price,
-                        spread_pct: mn_spread, gas_gwei: mn.gas_gwei,
-                        net_hedge_pnl: mn_pnl, flow: mn_flow,
-                    });
-                    ui.push_arbitrum(ChainSnapshot {
-                        time: now, dex_price: arb.dex_price,
-                        spread_pct: arb_spread, gas_gwei: arb.gas_gwei,
-                        net_hedge_pnl: arb_pnl, flow: arb_flow,
-                    });
+                    if let (Some(data), Some((spread, pnl, flow))) = (mn, mn_result) {
+                        ui.push_mainnet(ChainSnapshot {
+                            time: now.clone(),
+                            dex_price: data.dex_price,
+                            spread_pct: spread,
+                            gas_gwei: data.gas_gwei,
+                            net_hedge_pnl: pnl,
+                            flow,
+                        });
+                    }
+                    if let (Some(data), Some((spread, pnl, flow))) = (arb, arb_result) {
+                        ui.push_arbitrum(ChainSnapshot {
+                            time: now,
+                            dex_price: data.dex_price,
+                            spread_pct: spread,
+                            gas_gwei: data.gas_gwei,
+                            net_hedge_pnl: pnl,
+                            flow,
+                        });
+                    }
                 }
                 let _ = redraw_tx.send(()); // Trigger UI redraw
             }
