@@ -4,11 +4,17 @@ use anyhow::{bail, Context};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::watch;
-use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::protocol::WebSocketConfig};
 use tokio_tungstenite::Connector;
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::protocol::WebSocketConfig};
 use tracing::{error, info, warn};
 
+use crate::config::{ChainConfig, PoolToken};
+
 const SLOT0_SELECTOR: &str = "0x3850c7bd";
+const TOKEN0_SELECTOR: &str = "0x0dfe1681";
+const TOKEN1_SELECTOR: &str = "0xd21220a7";
+const FEE_SELECTOR: &str = "0xddca3f43";
+const DECIMALS_SELECTOR: &str = "0x313ce567";
 
 // ── Binance WebSocket ─────────────────────────────────────────────────────
 
@@ -36,7 +42,7 @@ pub async fn run_binance(ws_url: String, sender: watch::Sender<Option<BinanceTic
                         let bid = v["b"].as_str().and_then(|s| s.parse::<f64>().ok());
                         let ask = v["a"].as_str().and_then(|s| s.parse::<f64>().ok());
                         let event_time = v["E"].as_u64();
-                        
+
                         if let (Some(b), Some(a), Some(e_ms)) = (bid, ask, event_time) {
                             if !b.is_finite() || !a.is_finite() || b <= 0.0 || a < b {
                                 continue;
@@ -57,7 +63,10 @@ pub async fn run_binance(ws_url: String, sender: watch::Sender<Option<BinanceTic
                 warn!("Binance WS connection lost, reconnecting...");
             }
             Err(e) => {
-                error!("Binance WS connection failed: {}. Retrying in {}s...", e, backoff);
+                error!(
+                    "Binance WS connection failed: {}. Retrying in {}s...",
+                    e, backoff
+                );
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(60);
             }
@@ -67,7 +76,7 @@ pub async fn run_binance(ws_url: String, sender: watch::Sender<Option<BinanceTic
 
 // ── Raw JSON-RPC helpers ──────────────────────────────────────────────────
 
-fn sqrt_price_x96_to_eth_usdc(hex: &str) -> Option<f64> {
+fn sqrt_price_x96_to_eth_usdc(hex: &str, config: &ChainConfig) -> Option<f64> {
     const SLOT0_HEX_LEN: usize = 7 * 64;
 
     let data = hex.strip_prefix("0x")?;
@@ -86,8 +95,15 @@ fn sqrt_price_x96_to_eth_usdc(hex: &str) -> Option<f64> {
         return None;
     }
 
-    let ratio = (sqrt / 2f64.powi(96)).powi(2);
-    let price = 1e12 / ratio;
+    // slot0 is a raw token1/token0 ratio; adjust token units before orienting it.
+    let raw_token1_per_token0 = (sqrt / 2f64.powi(96)).powi(2);
+    let decimal_scale = 10f64.powi(config.token0_decimals as i32 - config.token1_decimals as i32);
+    let token1_per_token0 = raw_token1_per_token0 * decimal_scale;
+    let price = match (config.base_token, config.quote_token) {
+        (PoolToken::Token0, PoolToken::Token1) => token1_per_token0,
+        (PoolToken::Token1, PoolToken::Token0) => 1.0 / token1_per_token0,
+        _ => return None,
+    };
     (price.is_finite() && price > 0.0).then_some(price)
 }
 
@@ -96,6 +112,7 @@ mod tests {
     use serde_json::json;
 
     use super::{parse_rpc_response, sqrt_price_x96_to_eth_usdc};
+    use crate::config::{ChainConfig, PoolToken};
 
     const VALID_SLOT0_RESPONSE: &str = concat!(
         "0x0000000000000000000000000000000000004e8455ae2c26d4ba3f97c7d0a2c9",
@@ -107,12 +124,57 @@ mod tests {
         "0000000000000000000000000000000000000000000000000000000000000001",
     );
 
+    fn chain_config(
+        token0_decimals: u8,
+        token1_decimals: u8,
+        base_token: PoolToken,
+        quote_token: PoolToken,
+    ) -> ChainConfig {
+        ChainConfig {
+            rpc_url: "https://example.com".to_string(),
+            chain_id: 1,
+            pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+            token0_address: "0x0000000000000000000000000000000000000002".to_string(),
+            token0_decimals,
+            token1_address: "0x0000000000000000000000000000000000000003".to_string(),
+            token1_decimals,
+            base_token,
+            quote_token,
+            fee: 500,
+        }
+    }
+
+    fn slot0_response(sqrt_price_x96: u128) -> String {
+        format!("0x{sqrt_price_x96:064x}{}", "0".repeat(6 * 64))
+    }
+
     #[test]
     fn decodes_sqrt_price_from_first_slot0_word() {
-        let price =
-            sqrt_price_x96_to_eth_usdc(VALID_SLOT0_RESPONSE).expect("valid slot0 response");
+        let config = chain_config(6, 18, PoolToken::Token1, PoolToken::Token0);
+        let price = sqrt_price_x96_to_eth_usdc(VALID_SLOT0_RESPONSE, &config)
+            .expect("valid slot0 response");
 
         assert!((price - 2_475.10383023333).abs() < 0.01);
+    }
+
+    #[test]
+    fn derives_quote_per_base_for_token1_base_with_6_and_18_decimals() {
+        let config = chain_config(6, 18, PoolToken::Token1, PoolToken::Token0);
+        let payload = slot0_response((1u128 << 96) * 20_000);
+
+        let price = sqrt_price_x96_to_eth_usdc(&payload, &config).expect("valid price");
+
+        assert!((price - 2_500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn derives_quote_per_base_for_token0_base_with_18_and_6_decimals() {
+        let config = chain_config(18, 6, PoolToken::Token0, PoolToken::Token1);
+        let payload = slot0_response((1u128 << 96) / 20_000);
+
+        let price = sqrt_price_x96_to_eth_usdc(&payload, &config).expect("valid price");
+
+        assert!((price - 2_500.0).abs() < 1e-6);
     }
 
     #[test]
@@ -121,9 +183,10 @@ mod tests {
         let zero = format!("0x{}", "0".repeat(7 * 64));
         let mut non_hex = VALID_SLOT0_RESPONSE.to_owned();
         non_hex.replace_range(non_hex.len() - 1.., "z");
+        let config = chain_config(6, 18, PoolToken::Token1, PoolToken::Token0);
 
         for payload in ["", "0x", truncated, zero.as_str(), non_hex.as_str()] {
-            assert!(sqrt_price_x96_to_eth_usdc(payload).is_none());
+            assert!(sqrt_price_x96_to_eth_usdc(payload, &config).is_none());
         }
     }
 
@@ -159,6 +222,60 @@ fn parse_rpc_response(body: &str) -> anyhow::Result<Value> {
         .context("JSON-RPC response has no result")
 }
 
+fn decode_rpc_quantity(value: &Value, field: &str) -> anyhow::Result<u64> {
+    let encoded = value
+        .as_str()
+        .with_context(|| format!("{field} is not a hex quantity"))?;
+    let data = encoded
+        .strip_prefix("0x")
+        .filter(|data| !data.is_empty() && data.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .with_context(|| format!("{field} is not a hex quantity"))?;
+    u64::from_str_radix(data, 16).with_context(|| format!("{field} exceeds u64"))
+}
+
+fn decode_abi_u64(value: &Value, field: &str) -> anyhow::Result<u64> {
+    let encoded = value
+        .as_str()
+        .with_context(|| format!("{field} is not an ABI word"))?;
+    let data = encoded
+        .strip_prefix("0x")
+        .filter(|data| data.len() == 64 && data.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .with_context(|| format!("{field} is not one ABI word"))?;
+    if !data[..48].bytes().all(|byte| byte == b'0') {
+        bail!("{field} exceeds u64");
+    }
+    u64::from_str_radix(&data[48..], 16).with_context(|| format!("invalid {field}"))
+}
+
+fn decode_abi_address(value: &Value, field: &str) -> anyhow::Result<String> {
+    let encoded = value
+        .as_str()
+        .with_context(|| format!("{field} is not an ABI address"))?;
+    let data = encoded
+        .strip_prefix("0x")
+        .filter(|data| data.len() == 64 && data.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .with_context(|| format!("{field} is not one ABI word"))?;
+    if !data[..24].bytes().all(|byte| byte == b'0') {
+        bail!("{field} has non-zero ABI padding");
+    }
+    Ok(format!("0x{}", &data[24..]))
+}
+
+fn validate_contract_code(value: &Value) -> anyhow::Result<()> {
+    let encoded = value.as_str().context("eth_getCode result is not hex")?;
+    let data = encoded
+        .strip_prefix("0x")
+        .context("eth_getCode result has no 0x prefix")?;
+    if data.is_empty()
+        || data.len() % 2 != 0
+        || !data.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || data.bytes().all(|byte| byte == b'0')
+    {
+        bail!("configured pool has no valid contract bytecode");
+    }
+    Ok(())
+}
+
 async fn rpc_call(
     client: &reqwest::Client,
     url: &str,
@@ -183,32 +300,153 @@ async fn rpc_call(
     Ok((parse_rpc_response(&body)?, rtt))
 }
 
+async fn verify_chain_config(client: &reqwest::Client, config: &ChainConfig) -> anyhow::Result<()> {
+    let (chain_id, _) = rpc_call(client, &config.rpc_url, "eth_chainId", json!([])).await?;
+    let actual_chain_id = decode_rpc_quantity(&chain_id, "eth_chainId")?;
+    if actual_chain_id != config.chain_id {
+        bail!(
+            "RPC chain ID {actual_chain_id} does not match configured {}",
+            config.chain_id
+        );
+    }
+
+    let (code, _) = rpc_call(
+        client,
+        &config.rpc_url,
+        "eth_getCode",
+        json!([&config.pool_address, "latest"]),
+    )
+    .await?;
+    validate_contract_code(&code)?;
+
+    let (token0, _) = rpc_call(
+        client,
+        &config.rpc_url,
+        "eth_call",
+        json!([{"to": &config.pool_address, "data": TOKEN0_SELECTOR}, "latest"]),
+    )
+    .await?;
+    let token0 = decode_abi_address(&token0, "token0()")?;
+    if !token0.eq_ignore_ascii_case(&config.token0_address) {
+        bail!(
+            "pool token0 {token0} does not match configured {}",
+            config.token0_address
+        );
+    }
+
+    let (token1, _) = rpc_call(
+        client,
+        &config.rpc_url,
+        "eth_call",
+        json!([{"to": &config.pool_address, "data": TOKEN1_SELECTOR}, "latest"]),
+    )
+    .await?;
+    let token1 = decode_abi_address(&token1, "token1()")?;
+    if !token1.eq_ignore_ascii_case(&config.token1_address) {
+        bail!(
+            "pool token1 {token1} does not match configured {}",
+            config.token1_address
+        );
+    }
+
+    let (fee, _) = rpc_call(
+        client,
+        &config.rpc_url,
+        "eth_call",
+        json!([{"to": &config.pool_address, "data": FEE_SELECTOR}, "latest"]),
+    )
+    .await?;
+    let fee = decode_abi_u64(&fee, "fee()")?;
+    if fee != config.fee as u64 {
+        bail!("pool fee {fee} does not match configured {}", config.fee);
+    }
+
+    for (token, expected_decimals, field) in [
+        (
+            &config.token0_address,
+            config.token0_decimals,
+            "token0 decimals",
+        ),
+        (
+            &config.token1_address,
+            config.token1_decimals,
+            "token1 decimals",
+        ),
+    ] {
+        let (decimals, _) = rpc_call(
+            client,
+            &config.rpc_url,
+            "eth_call",
+            json!([{"to": token, "data": DECIMALS_SELECTOR}, "latest"]),
+        )
+        .await?;
+        let decimals = decode_abi_u64(&decimals, field)?;
+        if decimals != expected_decimals as u64 {
+            bail!("{field} {decimals} does not match configured {expected_decimals}");
+        }
+    }
+
+    let (slot0, _) = rpc_call(
+        client,
+        &config.rpc_url,
+        "eth_call",
+        json!([{"to": &config.pool_address, "data": SLOT0_SELECTOR}, "latest"]),
+    )
+    .await?;
+    let price = slot0
+        .as_str()
+        .and_then(|value| sqrt_price_x96_to_eth_usdc(value, config))
+        .context("pool slot0() did not produce a valid configured price")?;
+
+    info!(
+        "Verified chain {} pool {} metadata; ETH/USDC price {:.2}",
+        config.chain_id, config.pool_address, price
+    );
+    Ok(())
+}
+
 // ── Public types & poller ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct ChainData {
     pub dex_price: f64,
-    pub gas_gwei:  f64,
+    pub gas_gwei: f64,
     pub rpc_latency_ms: u64,
 }
 
 pub async fn run_chain_poller(
     client: reqwest::Client,
-    rpc_url: String,
-    pool_addr: String,
+    config: ChainConfig,
     sender: watch::Sender<Option<ChainData>>,
 ) {
     loop {
-        let p_params = json!([{"to": pool_addr, "data": SLOT0_SELECTOR}, "latest"]);
+        match verify_chain_config(&client, &config).await {
+            Ok(()) => break,
+            Err(error) => {
+                warn!(
+                    "Chain {} pool metadata verification failed; refusing DEX observations: {error}",
+                    config.chain_id
+                );
+                sender.send_if_modified(|current| current.take().is_some());
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+
+    loop {
+        let p_params = json!([{"to": &config.pool_address, "data": SLOT0_SELECTOR}, "latest"]);
         let g_params = json!([]);
 
         let (p_res, g_res) = tokio::join!(
-            rpc_call(&client, &rpc_url, "eth_call", p_params),
-            rpc_call(&client, &rpc_url, "eth_gasPrice", g_params)
+            rpc_call(&client, &config.rpc_url, "eth_call", p_params),
+            rpc_call(&client, &config.rpc_url, "eth_gasPrice", g_params)
         );
 
         let (price, price_rtt) = match p_res {
-            Ok((value, rtt)) => match value.as_str().and_then(sqrt_price_x96_to_eth_usdc) {
+            Ok((value, rtt)) => match value
+                .as_str()
+                .and_then(|value| sqrt_price_x96_to_eth_usdc(value, &config))
+            {
                 Some(price) => (price, rtt),
                 None => {
                     warn!("Invalid eth_call slot0 result; skipping DEX observation");
@@ -248,4 +486,3 @@ pub async fn run_chain_poller(
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
-
