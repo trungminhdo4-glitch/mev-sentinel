@@ -77,10 +77,11 @@ pub struct QuantEngine {
     pub binance_latency_ms:   u64,
     pub rpc_latency_ms:       u64,
     pub vola_interval_sec:    f64,
+    critical_lvr_usd:         f64,
 }
 
 impl QuantEngine {
-    pub fn new(vola_interval_sec: f64) -> Self {
+    pub fn new(vola_interval_sec: f64, critical_lvr_usd: f64) -> Self {
         Self {
             prices:               VecDeque::with_capacity(RING_CAPACITY),
             mainnet_last_dex:     None,
@@ -92,6 +93,7 @@ impl QuantEngine {
             binance_latency_ms:   0,
             rpc_latency_ms:       0,
             vola_interval_sec,
+            critical_lvr_usd,
         }
     }
 
@@ -186,7 +188,7 @@ impl QuantEngine {
 
         let flow = if jit {
             FlowType::JitAttack
-        } else if net_pnl > 0.0 {
+        } else if net_pnl >= self.critical_lvr_usd {
             FlowType::CriticalLvr
         } else if spread > fee {
             FlowType::PotentialLvr
@@ -200,11 +202,11 @@ impl QuantEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{BinanceTicker, QuantEngine};
+    use super::{BinanceTicker, FlowType, QuantEngine};
 
     #[test]
     fn invalid_dex_prices_are_not_classified_or_recorded() {
-        let mut engine = QuantEngine::new(2.0);
+        let mut engine = QuantEngine::new(2.0, 1.0);
         let ticker = BinanceTicker {
             best_bid: 2_499.0,
             best_ask: 2_501.0,
@@ -224,5 +226,35 @@ mod tests {
         assert!(engine
             .classify("mainnet", ticker, 2_500.0, 0.0005, 20.0, 0.0)
             .is_some());
+    }
+
+    #[test]
+    fn critical_lvr_respects_configured_threshold_including_boundary() {
+        let ticker = BinanceTicker {
+            best_bid: 1_000.0,
+            best_ask: 1_000.0,
+            latency_ms: 10,
+        };
+
+        let mut dollar_threshold = QuantEngine::new(2.0, 1.0);
+        let (_, net_pnl, flow) = dollar_threshold
+            .classify("mainnet", ticker, 998.5, 0.0, 0.0, 0.0)
+            .expect("valid observation");
+        assert_eq!(net_pnl, 0.5);
+        assert_eq!(flow, FlowType::PotentialLvr);
+
+        let mut quarter_threshold = QuantEngine::new(2.0, 0.25);
+        let (_, same_net_pnl, flow) = quarter_threshold
+            .classify("mainnet", ticker, 998.5, 0.0, 0.0, 0.0)
+            .expect("valid observation");
+        assert_eq!(same_net_pnl, net_pnl);
+        assert_eq!(flow, FlowType::CriticalLvr);
+
+        let mut boundary_threshold = QuantEngine::new(2.0, 0.5);
+        let (_, boundary_net_pnl, flow) = boundary_threshold
+            .classify("mainnet", ticker, 998.5, 0.0, 0.0, 0.0)
+            .expect("valid observation");
+        assert_eq!(boundary_net_pnl, 0.5);
+        assert_eq!(flow, FlowType::CriticalLvr);
     }
 }
