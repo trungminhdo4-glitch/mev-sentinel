@@ -65,12 +65,33 @@ pub async fn run_binance(ws_url: String, sender: watch::Sender<BinanceTicker>) {
 fn sqrt_price_x96_to_eth_usdc(hex: &str) -> Option<f64> {
     let s = hex.trim_start_matches("0x");
     if s.len() < 64 { return None; }
-    let tail = &s[s.len()-32..];
-    let sqrt = u128::from_str_radix(tail, 16).ok()?;
+    let sqrt = u128::from_str_radix(&s[..64], 16).ok()?;
     if sqrt == 0 { return None; }
     let ratio = (sqrt as f64 / 2f64.powi(96)).powi(2);
     if ratio == 0.0 { return None; }
     Some(1e12 / ratio)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sqrt_price_x96_to_eth_usdc;
+
+    #[test]
+    fn decodes_sqrt_price_from_first_slot0_word() {
+        let response = concat!(
+            "0x0000000000000000000000000000000000004e8455ae2c26d4ba3f97c7d0a2c9",
+            "0000000000000000000000000000000000000000000000000000000000030623",
+            "00000000000000000000000000000000000000000000000000000000000002b6",
+            "00000000000000000000000000000000000000000000000000000000000002d3",
+            "00000000000000000000000000000000000000000000000000000000000002d3",
+            "0000000000000000000000000000000000000000000000000000000000000044",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        );
+
+        let price = sqrt_price_x96_to_eth_usdc(response).expect("valid slot0 response");
+
+        assert!((price - 2_475.10383023333).abs() < 0.01);
+    }
 }
 
 async fn rpc_call(client: &reqwest::Client, url: &str, method: &str, params: Value) -> (Option<Value>, u64) {
