@@ -17,7 +17,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::watch;
-use tracing::{info, error, Level};
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use engine::{ChainSnapshot, FlowType, QuantEngine};
@@ -27,7 +27,7 @@ use config::Config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cfg = Config::load().expect("Failed to load config.toml");
+    let cfg = Config::load()?;
 
     // ── Logging Setup ─────────────────────────────────────────────────────
     let log_file = std::fs::File::create("sentinel.log")?;
@@ -58,8 +58,8 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Spawn data tasks ──────────────────────────────────────────────────
     tokio::spawn(run_binance(cfg.network.binance_ws.clone(), binance_tx));
-    tokio::spawn(run_chain_poller(client.clone(), cfg.network.mainnet_rpc.clone(), cfg.pool.address.clone(), mainnet_tx));
-    tokio::spawn(run_chain_poller(client.clone(), cfg.network.arbitrum_rpc.clone(), cfg.pool.address.clone(), arbitrum_tx));
+    tokio::spawn(run_chain_poller(client.clone(), cfg.chains.mainnet.clone(), mainnet_tx));
+    tokio::spawn(run_chain_poller(client.clone(), cfg.chains.arbitrum.clone(), arbitrum_tx));
 
     // ── Aggregation task (Event-Driven) ───────────────────────────────────
     let (redraw_tx, mut redraw_rx) = watch::channel(());
@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
                                 "mainnet",
                                 ticker,
                                 data.dex_price,
-                                cfg.pool.fee_tier,
+                                cfg.chains.mainnet.fee_rate(),
                                 data.gas_gwei,
                                 0.0,
                             )
@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
                                 "arbitrum",
                                 ticker,
                                 data.dex_price,
-                                cfg.pool.fee_tier,
+                                cfg.chains.arbitrum.fee_rate(),
                                 data.gas_gwei,
                                 l1_base_fee_gwei,
                             )

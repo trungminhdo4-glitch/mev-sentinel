@@ -2,12 +2,30 @@
 
 [network]
 binance_ws = "wss://stream.binance.com:9443/ws/ethusdt@ticker"
-mainnet_rpc = "https://ethereum.publicnode.com"
-arbitrum_rpc = "https://arbitrum.publicnode.com"
 
-[pool]
-address = "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"
-fee_tier = 0.0005 # 0.05%
+[chains.mainnet]
+rpc_url = "https://ethereum.publicnode.com"
+chain_id = 1
+pool_address = "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"
+token0_address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" # USDC
+token0_decimals = 6
+token1_address = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2" # WETH
+token1_decimals = 18
+base_token = "token1" # WETH
+quote_token = "token0" # USDC
+fee = 500 # 0.05%, in Uniswap fee millionths
+
+[chains.arbitrum]
+rpc_url = "https://arbitrum.publicnode.com"
+chain_id = 42161
+pool_address = "0xc31e54c7a869b9fcbecc14363cf510d1c41fa443"
+token0_address = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" # WETH
+token0_decimals = 18
+token1_address = "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8" # USDC.e
+token1_decimals = 6
+base_token = "token0" # WETH
+quote_token = "token1" # USDC.e
+fee = 500 # 0.05%, in Uniswap fee millionths
 
 [thresholds]
 critical_lvr_usd = 1.0
