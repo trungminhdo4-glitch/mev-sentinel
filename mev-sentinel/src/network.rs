@@ -2,13 +2,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
 use futures_util::StreamExt;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::protocol::WebSocketConfig};
 use tracing::{error, info, warn};
 
-use crate::config::{ChainConfig, PoolToken};
+use crate::config::{ChainConfig, NetworkConfig, PoolToken};
 
 const SLOT0_SELECTOR: &str = "0x3850c7bd";
 const TOKEN0_SELECTOR: &str = "0x0dfe1681";
@@ -25,41 +26,88 @@ pub struct BinanceTicker {
     pub latency_ms: u64,
 }
 
-pub async fn run_binance(ws_url: String, sender: watch::Sender<Option<BinanceTicker>>) {
+#[derive(Deserialize)]
+struct BinanceTickerPayload {
+    #[serde(rename = "e")]
+    event_type: String,
+    #[serde(rename = "E")]
+    event_time_ms: u64,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "b")]
+    best_bid: String,
+    #[serde(rename = "B")]
+    best_bid_quantity: String,
+    #[serde(rename = "a")]
+    best_ask: String,
+    #[serde(rename = "A")]
+    best_ask_quantity: String,
+}
+
+fn parse_binance_ticker(
+    payload: &str,
+    config: &NetworkConfig,
+    received_at_ms: u64,
+) -> Option<BinanceTicker> {
+    let raw: BinanceTickerPayload = serde_json::from_str(payload).ok()?;
+    if raw.event_type != "24hrTicker"
+        || raw.event_time_ms == 0
+        || !config.matches_binance_symbol(&raw.symbol)
+    {
+        return None;
+    }
+
+    let bid = raw.best_bid.parse::<f64>().ok()?;
+    let ask = raw.best_ask.parse::<f64>().ok()?;
+    let bid_quantity = raw.best_bid_quantity.parse::<f64>().ok()?;
+    let ask_quantity = raw.best_ask_quantity.parse::<f64>().ok()?;
+    if !bid.is_finite()
+        || !ask.is_finite()
+        || !bid_quantity.is_finite()
+        || !ask_quantity.is_finite()
+        || bid <= 0.0
+        || ask < bid
+        || bid_quantity < 0.0
+        || ask_quantity < 0.0
+    {
+        return None;
+    }
+
+    Some(BinanceTicker {
+        best_bid: bid,
+        best_ask: ask,
+        latency_ms: received_at_ms.saturating_sub(raw.event_time_ms),
+    })
+}
+
+pub async fn run_binance(config: NetworkConfig, sender: watch::Sender<Option<BinanceTicker>>) {
     let tls = native_tls::TlsConnector::new().expect("TLS init failed");
     let connector = Connector::NativeTls(tls);
     let mut backoff = 1;
 
     loop {
         let cfg: Option<WebSocketConfig> = None;
-        match connect_async_tls_with_config(&ws_url, cfg, false, Some(connector.clone())).await {
+        match connect_async_tls_with_config(&config.binance_ws, cfg, false, Some(connector.clone()))
+            .await
+        {
             Ok((mut ws, _)) => {
                 info!("Connected to Binance WS");
                 backoff = 1;
                 while let Some(Ok(msg)) = ws.next().await {
-                    let text = msg.into_text().unwrap_or_default();
-                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                        let bid = v["b"].as_str().and_then(|s| s.parse::<f64>().ok());
-                        let ask = v["a"].as_str().and_then(|s| s.parse::<f64>().ok());
-                        let event_time = v["E"].as_u64();
-
-                        if let (Some(b), Some(a), Some(e_ms)) = (bid, ask, event_time) {
-                            if !b.is_finite() || !a.is_finite() || b <= 0.0 || a < b {
-                                continue;
-                            }
-                            let now_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64;
-                            let latency = now_ms.saturating_sub(e_ms);
-                            let _ = sender.send(Some(BinanceTicker {
-                                best_bid: b,
-                                best_ask: a,
-                                latency_ms: latency,
-                            }));
-                        }
+                    let Ok(text) = msg.into_text() else {
+                        continue;
+                    };
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    if let Some(ticker) = parse_binance_ticker(&text, &config, now_ms) {
+                        let _ = sender.send(Some(ticker));
+                    } else {
+                        sender.send_if_modified(|current| current.take().is_some());
                     }
                 }
+                sender.send_if_modified(|current| current.take().is_some());
                 warn!("Binance WS connection lost, reconnecting...");
             }
             Err(e) => {
@@ -111,8 +159,8 @@ fn sqrt_price_x96_to_eth_usdc(hex: &str, config: &ChainConfig) -> Option<f64> {
 mod tests {
     use serde_json::json;
 
-    use super::{parse_rpc_response, sqrt_price_x96_to_eth_usdc};
-    use crate::config::{ChainConfig, PoolToken};
+    use super::{parse_binance_ticker, parse_rpc_response, sqrt_price_x96_to_eth_usdc};
+    use crate::config::{ChainConfig, NetworkConfig, PoolToken};
 
     const VALID_SLOT0_RESPONSE: &str = concat!(
         "0x0000000000000000000000000000000000004e8455ae2c26d4ba3f97c7d0a2c9",
@@ -146,6 +194,57 @@ mod tests {
 
     fn slot0_response(sqrt_price_x96: u128) -> String {
         format!("0x{sqrt_price_x96:064x}{}", "0".repeat(6 * 64))
+    }
+
+    fn binance_config() -> NetworkConfig {
+        NetworkConfig {
+            binance_ws: "wss://example.com/ethusdc@ticker".to_string(),
+            binance_base_asset: "ETH".to_string(),
+            binance_quote_asset: "USDC".to_string(),
+        }
+    }
+
+    #[test]
+    fn parses_matching_ethusdc_book_ticker() {
+        let ticker = parse_binance_ticker(
+            r#"{"e":"24hrTicker","E":900,"s":"ETHUSDC","b":"2499.25","B":"1.5","a":"2500.75","A":"2.5"}"#,
+            &binance_config(),
+            1_000,
+        )
+        .expect("matching ticker");
+
+        assert_eq!(ticker.best_bid, 2_499.25);
+        assert_eq!(ticker.best_ask, 2_500.75);
+        assert_eq!(ticker.latency_ms, 100);
+    }
+
+    #[test]
+    fn rejects_wrong_binance_pairs() {
+        let config = binance_config();
+        for symbol in ["ETHUSDT", "BTCUSDC"] {
+            let payload = format!(
+                r#"{{"e":"24hrTicker","E":900,"s":"{symbol}","b":"2499.25","B":"1.5","a":"2500.75","A":"2.5"}}"#
+            );
+
+            assert!(parse_binance_ticker(&payload, &config, 1_000).is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_binance_tickers() {
+        let config = binance_config();
+        for payload in [
+            "",
+            "not json",
+            r#"{"e":"24hrTicker","E":900,"b":"2499.25","B":"1.5","a":"2500.75","A":"2.5"}"#,
+            r#"{"e":"24hrTicker","E":900,"s":"ETHUSDC","b":"bad","B":"1.5","a":"2500.75","A":"2.5"}"#,
+            r#"{"e":"24hrTicker","E":900,"s":"ETHUSDC","b":"2501","B":"1.5","a":"2500","A":"2.5"}"#,
+            r#"{"e":"24hrTicker","E":900,"s":"ETHUSDC","b":"2499.25","a":"2500.75"}"#,
+            r#"{"e":"bookTicker","E":900,"s":"ETHUSDC","b":"2499.25","B":"1.5","a":"2500.75","A":"2.5"}"#,
+            r#"{"e":"24hrTicker","s":"ETHUSDC","b":"2499.25","B":"1.5","a":"2500.75","A":"2.5"}"#,
+        ] {
+            assert!(parse_binance_ticker(payload, &config, 1_000).is_none());
+        }
     }
 
     #[test]

@@ -1,7 +1,9 @@
 # MEV Sentinel Configuration
 
 [network]
-binance_ws = "wss://stream.binance.com:9443/ws/ethusdt@ticker"
+binance_ws = "wss://stream.binance.com:9443/ws/ethusdc@ticker"
+binance_base_asset = "ETH"
+binance_quote_asset = "USDC"
 
 [chains.mainnet]
 rpc_url = "https://ethereum.publicnode.com"

@@ -15,6 +15,8 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     pub binance_ws: String,
+    pub binance_base_asset: String,
+    pub binance_quote_asset: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -72,6 +74,25 @@ impl Config {
             &["ws", "wss"],
             "network.binance_ws",
         )?;
+        for (field, asset) in [
+            ("binance_base_asset", &self.network.binance_base_asset),
+            ("binance_quote_asset", &self.network.binance_quote_asset),
+        ] {
+            if asset.is_empty()
+                || !asset
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            {
+                bail!("network.{field} must contain only uppercase ASCII letters and digits");
+            }
+        }
+        if self
+            .network
+            .binance_base_asset
+            .eq(&self.network.binance_quote_asset)
+        {
+            bail!("network Binance base and quote assets must be different");
+        }
         self.chains.mainnet.validate("chains.mainnet")?;
         self.chains.arbitrum.validate("chains.arbitrum")?;
 
@@ -87,6 +108,12 @@ impl Config {
             bail!("thresholds.vola_interval_sec must be finite and greater than zero");
         }
         Ok(())
+    }
+}
+
+impl NetworkConfig {
+    pub fn matches_binance_symbol(&self, symbol: &str) -> bool {
+        symbol.strip_prefix(&self.binance_base_asset) == Some(self.binance_quote_asset.as_str())
     }
 }
 
@@ -153,7 +180,9 @@ mod tests {
 
     const VALID_CONFIG: &str = r#"
 [network]
-binance_ws = "wss://example.com/ticker"
+    binance_ws = "wss://example.com/ethusdc@ticker"
+binance_base_asset = "ETH"
+binance_quote_asset = "USDC"
 
 [chains.mainnet]
 rpc_url = "https://example.com/mainnet"
@@ -189,6 +218,8 @@ vola_interval_sec = 2.0
     fn deserializes_per_chain_pool_metadata() {
         let config = Config::parse(VALID_CONFIG).expect("valid config");
 
+        assert!(config.network.matches_binance_symbol("ETHUSDC"));
+        assert!(!config.network.matches_binance_symbol("ETHUSDT"));
         assert_eq!(config.chains.mainnet.chain_id, 1);
         assert_eq!(config.chains.mainnet.token0_decimals, 6);
         assert_eq!(config.chains.mainnet.token1_decimals, 18);
@@ -200,6 +231,26 @@ vola_interval_sec = 2.0
         assert_eq!(config.chains.arbitrum.base_token, PoolToken::Token0);
         assert_eq!(config.chains.arbitrum.quote_token, PoolToken::Token1);
         assert!((config.chains.arbitrum.fee_rate() - 0.0005).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rejects_invalid_binance_pair_configuration() {
+        for content in [
+            VALID_CONFIG.replace(
+                "binance_base_asset = \"ETH\"",
+                "binance_base_asset = \"eth\"",
+            ),
+            VALID_CONFIG.replace(
+                "binance_quote_asset = \"USDC\"",
+                "binance_quote_asset = \"ETH\"",
+            ),
+            VALID_CONFIG.replace(
+                "binance_quote_asset = \"USDC\"",
+                "binance_quote_asset = \"\"",
+            ),
+        ] {
+            assert!(Config::parse(&content).is_err());
+        }
     }
 
     #[test]
