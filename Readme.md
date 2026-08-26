@@ -31,7 +31,12 @@ Install MSYS2 and ensure dlltool.exe is available.
 
 Set the environment variable: $env:DLLTOOL = "C:\msys64\mingw64\bin\dlltool.exe"
 
-Run: cargo build --release
+Run from the Rust crate directory:
+
+```powershell
+cd mev-sentinel
+cargo build --release
+```
 
 🗺️ Roadmap to Production (Enterprise Architecture Vision)
 While this MVP successfully quantifies LVR, scaling this into a Tier-1 Market Making execution engine requires transitioning to bare-metal infrastructure. Future architectural upgrades include:
