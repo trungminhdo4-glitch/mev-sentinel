@@ -45,3 +45,7 @@ Dynamic Slippage Modeling: Moving beyond fixed swap amounts by incorporating ful
 Risk Metrics Dashboard: Implementing real-time VaR (Value at Risk) and Sharpe Ratio estimations for LP positions.
 
 Supervisor Task Resilience: Wrapping critical async tasks in a robust actor model to handle silent WS disconnects with exponential backoff and state recovery.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
