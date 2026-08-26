@@ -31,7 +31,12 @@ Install MSYS2 and ensure dlltool.exe is available.
 
 Set the environment variable: $env:DLLTOOL = "C:\msys64\mingw64\bin\dlltool.exe"
 
-Run: cargo build --release
+Run from the Rust crate directory:
+
+```powershell
+cd mev-sentinel
+cargo build --release
+```
 
 🗺️ Roadmap to Production (Enterprise Architecture Vision)
 While this MVP successfully quantifies LVR, scaling this into a Tier-1 Market Making execution engine requires transitioning to bare-metal infrastructure. Future architectural upgrades include:
@@ -45,3 +50,7 @@ Dynamic Slippage Modeling: Moving beyond fixed swap amounts by incorporating ful
 Risk Metrics Dashboard: Implementing real-time VaR (Value at Risk) and Sharpe Ratio estimations for LP positions.
 
 Supervisor Task Resilience: Wrapping critical async tasks in a robust actor model to handle silent WS disconnects with exponential backoff and state recovery.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
