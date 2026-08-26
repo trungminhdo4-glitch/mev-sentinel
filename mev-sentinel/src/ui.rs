@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -5,14 +7,24 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Frame,
 };
+use tokio::time::Instant;
 
 use crate::engine::{ChainSnapshot, FlowType, PoolStats};
 
 pub struct UiState {
     pub cex_price: f64,
+    pub last_cex_price: f64,
     pub volatility: f64,
     pub binance_latency_ms: u64,
-    pub rpc_latency_ms:     u64,
+    pub rpc_latency_ms: u64,
+    pub cex_available: bool,
+    pub mainnet_rpc_available: bool,
+    pub arbitrum_rpc_available: bool,
+    pub cex_observed_at: Option<Instant>,
+    pub mainnet_rpc_observed_at: Option<Instant>,
+    pub arbitrum_rpc_observed_at: Option<Instant>,
+    pub critical_bell_pending: bool,
+    stale_after: Duration,
     pub mainnet_history: Vec<ChainSnapshot>,
     pub arbitrum_history: Vec<ChainSnapshot>,
     pub mainnet_stats: PoolStats,
@@ -20,12 +32,21 @@ pub struct UiState {
 }
 
 impl UiState {
-    pub fn new() -> Self {
+    pub fn new(stale_rpc_ms: u64) -> Self {
         UiState {
             cex_price: 0.0,
+            last_cex_price: 0.0,
             volatility: 0.0,
             binance_latency_ms: 0,
             rpc_latency_ms: 0,
+            cex_available: false,
+            mainnet_rpc_available: false,
+            arbitrum_rpc_available: false,
+            cex_observed_at: None,
+            mainnet_rpc_observed_at: None,
+            arbitrum_rpc_observed_at: None,
+            critical_bell_pending: false,
+            stale_after: Duration::from_millis(stale_rpc_ms),
             mainnet_history: Vec::with_capacity(50),
             arbitrum_history: Vec::with_capacity(50),
             mainnet_stats: PoolStats::default(),
@@ -33,7 +54,16 @@ impl UiState {
         }
     }
 
-    pub fn get_latency_status(&self) -> (&'static str, Color) {
+    pub fn get_latency_status_at(&self, now: Instant) -> (&'static str, Color) {
+        if !self.cex_available || !self.mainnet_rpc_available || !self.arbitrum_rpc_available {
+            return ("DATA UNAVAILABLE", Color::Red);
+        }
+        if !self.cex_is_fresh_at(now)
+            || !self.mainnet_rpc_is_fresh_at(now)
+            || !self.arbitrum_rpc_is_fresh_at(now)
+        {
+            return ("STALE DATA", Color::Red);
+        }
         let total = self.binance_latency_ms + self.rpc_latency_ms;
         if total < 150 {
             ("🟢 HEALTHY SYNC", Color::Green)
@@ -44,13 +74,79 @@ impl UiState {
         }
     }
 
+    pub fn final_cex_price(&self) -> f64 {
+        self.last_cex_price
+    }
+
+    fn cex_price_text(&self, now: Instant) -> String {
+        if !self.cex_available {
+            "UNAVAILABLE".to_string()
+        } else if self.cex_is_fresh_at(now) {
+            format!("${:.2}", self.cex_price)
+        } else {
+            "STALE".to_string()
+        }
+    }
+
+    fn volatility_text(&self, now: Instant) -> String {
+        if !self.cex_available {
+            "UNAVAILABLE".to_string()
+        } else if self.cex_is_fresh_at(now) {
+            format!("{:.1}%", self.volatility * 100.0)
+        } else {
+            "STALE".to_string()
+        }
+    }
+
+    fn binance_latency_text(&self, now: Instant) -> String {
+        if !self.cex_available {
+            "UNAVAILABLE".to_string()
+        } else if self.cex_is_fresh_at(now) {
+            format!("{}ms", self.binance_latency_ms)
+        } else {
+            "STALE".to_string()
+        }
+    }
+
+    fn rpc_latency_text(&self, now: Instant) -> String {
+        if !self.mainnet_rpc_available || !self.arbitrum_rpc_available {
+            "UNAVAILABLE".to_string()
+        } else if self.mainnet_rpc_is_fresh_at(now) && self.arbitrum_rpc_is_fresh_at(now) {
+            format!("{}ms", self.rpc_latency_ms)
+        } else {
+            "STALE".to_string()
+        }
+    }
+
+    fn cex_is_fresh_at(&self, now: Instant) -> bool {
+        self.observation_is_fresh(self.cex_observed_at, now)
+    }
+
+    fn mainnet_rpc_is_fresh_at(&self, now: Instant) -> bool {
+        self.observation_is_fresh(self.mainnet_rpc_observed_at, now)
+    }
+
+    fn arbitrum_rpc_is_fresh_at(&self, now: Instant) -> bool {
+        self.observation_is_fresh(self.arbitrum_rpc_observed_at, now)
+    }
+
+    fn observation_is_fresh(&self, observed_at: Option<Instant>, now: Instant) -> bool {
+        observed_at.is_some_and(|observed_at| {
+            now.saturating_duration_since(observed_at) <= self.stale_after
+        })
+    }
+
     pub fn push_mainnet(&mut self, snap: ChainSnapshot) {
-        if self.mainnet_history.len() >= 50 { self.mainnet_history.remove(0); }
+        if self.mainnet_history.len() >= 50 {
+            self.mainnet_history.remove(0);
+        }
         self.mainnet_history.push(snap);
     }
 
     pub fn push_arbitrum(&mut self, snap: ChainSnapshot) {
-        if self.arbitrum_history.len() >= 50 { self.arbitrum_history.remove(0); }
+        if self.arbitrum_history.len() >= 50 {
+            self.arbitrum_history.remove(0);
+        }
         self.arbitrum_history.push(snap);
     }
 }
@@ -59,9 +155,9 @@ pub fn render(f: &mut Frame, state: &UiState) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),  // header (expanded for lag info)
-            Constraint::Min(10),    // tables
-            Constraint::Length(6),  // stats
+            Constraint::Length(6), // header (expanded for lag info)
+            Constraint::Min(10),   // tables
+            Constraint::Length(6), // stats
         ])
         .split(f.area());
 
@@ -71,26 +167,73 @@ pub fn render(f: &mut Frame, state: &UiState) {
 }
 
 fn render_header(f: &mut Frame, area: Rect, state: &UiState) {
-    let (status_text, status_color) = state.get_latency_status();
-    
+    let now = Instant::now();
+    let (status_text, status_color) = state.get_latency_status_at(now);
+    let cex_color = if state.cex_available && state.cex_is_fresh_at(now) {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+
     let txt = vec![
         Line::from(vec![
-            Span::styled("  MEV SENTINEL  ", Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "  MEV SENTINEL  ",
+                Style::default()
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled("Binance ETH/USDC: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("${:.2}", state.cex_price), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                state.cex_price_text(now),
+                Style::default().fg(cex_color).add_modifier(Modifier::BOLD),
+            ),
             Span::raw("   "),
             Span::styled("σ (Ann.): ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{:.1}%", state.volatility * 100.0), Style::default().fg(Color::Magenta)),
+            Span::styled(
+                state.volatility_text(now),
+                Style::default().fg(if state.cex_available && state.cex_is_fresh_at(now) {
+                    Color::Magenta
+                } else {
+                    Color::Red
+                }),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  Lag: ", Style::default().fg(Color::DarkGray)),
             Span::raw("Binance ["),
-            Span::styled(format!("{}ms", state.binance_latency_ms), Style::default().fg(Color::White)),
+            Span::styled(
+                state.binance_latency_text(now),
+                Style::default().fg(if state.cex_available && state.cex_is_fresh_at(now) {
+                    Color::White
+                } else {
+                    Color::Red
+                }),
+            ),
             Span::raw("] │ RPC ["),
-            Span::styled(format!("{}ms", state.rpc_latency_ms), Style::default().fg(Color::White)),
+            Span::styled(
+                state.rpc_latency_text(now),
+                Style::default().fg(
+                    if state.mainnet_rpc_available
+                        && state.arbitrum_rpc_available
+                        && state.mainnet_rpc_is_fresh_at(now)
+                        && state.arbitrum_rpc_is_fresh_at(now)
+                    {
+                        Color::White
+                    } else {
+                        Color::Red
+                    },
+                ),
+            ),
             Span::raw("] │ Status: "),
-            Span::styled(status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                status_text,
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  Chains: ", Style::default().fg(Color::DarkGray)),
@@ -114,43 +257,90 @@ fn render_tables(f: &mut Frame, area: Rect, state: &UiState) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    render_chain_table(f, chunks[0], "Ethereum Mainnet", &state.mainnet_history, Color::Cyan);
-    render_chain_table(f, chunks[1], "Arbitrum One", &state.arbitrum_history, Color::Green);
+    render_chain_table(
+        f,
+        chunks[0],
+        "Ethereum Mainnet",
+        &state.mainnet_history,
+        Color::Cyan,
+    );
+    render_chain_table(
+        f,
+        chunks[1],
+        "Arbitrum One",
+        &state.arbitrum_history,
+        Color::Green,
+    );
 }
 
-fn render_chain_table(f: &mut Frame, area: Rect, title: &str, history: &[ChainSnapshot], color: Color) {
-    let header = Row::new(vec!["Time", "DEX Price", "Spread%", "Gas(Gwei)", "Hedge PnL", "Flow"])
-        .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
-        .bottom_margin(1);
-
-    let rows: Vec<Row> = history.iter().rev().take(12).map(|s| {
-        let flow_color = match s.flow {
-            FlowType::Retail => Color::Green,
-            FlowType::PotentialLvr => Color::Yellow,
-            FlowType::CriticalLvr => Color::Red,
-            FlowType::JitAttack => Color::LightRed,
-        };
-        let pnl_color = if s.net_hedge_pnl > 0.0 { Color::Red } else { Color::White };
-        Row::new(vec![
-            Cell::from(s.time.clone()),
-            Cell::from(format!("{:.2}", s.dex_price)),
-            Cell::from(format!("{:.4}%", s.spread_pct * 100.0)),
-            Cell::from(format!("{:.1}", s.gas_gwei)),
-            Cell::from(format!("${:+.3}", s.net_hedge_pnl)).style(Style::default().fg(pnl_color)),
-            Cell::from(s.flow.to_string()).style(Style::default().fg(flow_color)),
-        ])
-    }).collect();
-
-    let table = Table::new(rows, [
-        Constraint::Length(8),
-        Constraint::Length(9),
-        Constraint::Length(8),
-        Constraint::Length(10),
-        Constraint::Length(9),
-        Constraint::Min(14),
+fn render_chain_table(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    history: &[ChainSnapshot],
+    color: Color,
+) {
+    let header = Row::new(vec![
+        "Time",
+        "DEX Price",
+        "Spread%",
+        "Gas(Gwei)",
+        "Hedge PnL",
+        "Flow",
     ])
+    .style(
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )
+    .bottom_margin(1);
+
+    let rows: Vec<Row> = history
+        .iter()
+        .rev()
+        .take(12)
+        .map(|s| {
+            let flow_color = match s.flow {
+                FlowType::Retail => Color::Green,
+                FlowType::PotentialLvr => Color::Yellow,
+                FlowType::CriticalLvr => Color::Red,
+                FlowType::JitAttack => Color::LightRed,
+            };
+            let pnl_color = if s.net_hedge_pnl > 0.0 {
+                Color::Red
+            } else {
+                Color::White
+            };
+            Row::new(vec![
+                Cell::from(s.time.clone()),
+                Cell::from(format!("{:.2}", s.dex_price)),
+                Cell::from(format!("{:.4}%", s.spread_pct * 100.0)),
+                Cell::from(format!("{:.1}", s.gas_gwei)),
+                Cell::from(format!("${:+.3}", s.net_hedge_pnl))
+                    .style(Style::default().fg(pnl_color)),
+                Cell::from(s.flow.to_string()).style(Style::default().fg(flow_color)),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(9),
+            Constraint::Min(14),
+        ],
+    )
     .header(header)
-    .block(Block::default().borders(Borders::ALL).title(format!(" {title} ")).border_style(Style::default().fg(color)));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {title} "))
+            .border_style(Style::default().fg(color)),
+    );
 
     f.render_widget(table, area);
 }
@@ -161,11 +351,83 @@ fn render_stats(f: &mut Frame, area: Rect, state: &UiState) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    render_chain_stats(f, chunks[0], "Mainnet Backtest", &state.mainnet_stats, state.cex_price, state.volatility, Color::Cyan);
-    render_chain_stats(f, chunks[1], "Arbitrum Backtest", &state.arbitrum_stats, state.cex_price, state.volatility, Color::Green);
+    render_chain_stats(
+        f,
+        chunks[0],
+        "Mainnet Backtest",
+        &state.mainnet_stats,
+        state.last_cex_price,
+        state.volatility,
+        Color::Cyan,
+    );
+    render_chain_stats(
+        f,
+        chunks[1],
+        "Arbitrum Backtest",
+        &state.arbitrum_stats,
+        state.last_cex_price,
+        state.volatility,
+        Color::Green,
+    );
 }
 
-fn render_chain_stats(f: &mut Frame, area: Rect, title: &str, stats: &PoolStats, cex: f64, vola: f64, color: Color) {
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::UiState;
+
+    #[test]
+    fn unavailable_live_sources_do_not_report_zero_latency_as_healthy() {
+        let now = Instant::now();
+        let mut state = UiState::new(300);
+        state.last_cex_price = 2_500.0;
+        state.mainnet_stats.total_lvr_lost = 250.0;
+
+        assert_eq!(state.cex_price_text(now), "UNAVAILABLE");
+        assert_eq!(state.binance_latency_text(now), "UNAVAILABLE");
+        assert_eq!(state.rpc_latency_text(now), "UNAVAILABLE");
+        assert_eq!(state.get_latency_status_at(now).0, "DATA UNAVAILABLE");
+        assert_eq!(state.final_cex_price(), 2_500.0);
+        assert!(
+            state
+                .mainnet_stats
+                .lp_estimated_loss(state.final_cex_price())
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn old_observation_timestamps_cannot_display_healthy() {
+        let now = Instant::now();
+        let old = now - Duration::from_millis(301);
+        let mut state = UiState::new(300);
+        state.cex_available = true;
+        state.mainnet_rpc_available = true;
+        state.arbitrum_rpc_available = true;
+        state.cex_observed_at = Some(old);
+        state.mainnet_rpc_observed_at = Some(old);
+        state.arbitrum_rpc_observed_at = Some(old);
+        state.binance_latency_ms = 1;
+        state.rpc_latency_ms = 1;
+
+        assert_eq!(state.get_latency_status_at(now).0, "STALE DATA");
+        assert_eq!(state.binance_latency_text(now), "STALE");
+        assert_eq!(state.rpc_latency_text(now), "STALE");
+    }
+}
+
+fn render_chain_stats(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    stats: &PoolStats,
+    cex: f64,
+    vola: f64,
+    color: Color,
+) {
     let resistance = stats.lvr_resistance(vola);
     let resistance_txt = if resistance == f64::INFINITY {
         "∞ (no events)".to_string()
@@ -176,22 +438,41 @@ fn render_chain_stats(f: &mut Frame, area: Rect, title: &str, stats: &PoolStats,
     let txt = vec![
         Line::from(vec![
             Span::styled("Toxic Events: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(stats.toxic_event_count.to_string(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                stats.toxic_event_count.to_string(),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("Total LVR Lost (1ETH): ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("${:.4}", stats.total_lvr_lost), Style::default().fg(Color::Red)),
+            Span::styled(
+                "Total LVR Lost (1ETH): ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("${:.4}", stats.total_lvr_lost),
+                Style::default().fg(Color::Red),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("Est. LP Loss ($100k TVL): ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("${:.2}", stats.lp_estimated_loss(cex)), Style::default().fg(Color::LightRed)),
+            Span::styled(
+                "Est. LP Loss ($100k TVL): ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("${:.2}", stats.lp_estimated_loss(cex)),
+                Style::default().fg(Color::LightRed),
+            ),
         ]),
         Line::from(vec![
             Span::styled("LVR-Resistance: ", Style::default().fg(Color::DarkGray)),
             Span::styled(resistance_txt, Style::default().fg(Color::Green)),
         ]),
     ];
-    let para = Paragraph::new(txt)
-        .block(Block::default().borders(Borders::ALL).title(format!(" {title} ")).border_style(Style::default().fg(color)));
+    let para = Paragraph::new(txt).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {title} "))
+            .border_style(Style::default().fg(color)),
+    );
     f.render_widget(para, area);
 }
