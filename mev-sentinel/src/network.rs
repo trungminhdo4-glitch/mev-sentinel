@@ -5,6 +5,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::protocol::WebSocketConfig};
 use tracing::{error, info, warn};
@@ -17,10 +18,17 @@ const TOKEN1_SELECTOR: &str = "0xd21220a7";
 const FEE_SELECTOR: &str = "0xddca3f43";
 const DECIMALS_SELECTOR: &str = "0x313ce567";
 
+// Binance's <symbol>@ticker stream updates every 1,000ms.
+pub const BINANCE_TICKER_CADENCE: Duration = Duration::from_secs(1);
+pub const CHAIN_POLL_CADENCE: Duration = Duration::from_secs(2);
+
 // ── Binance WebSocket ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
 pub struct BinanceTicker {
+    pub sequence: u64,
+    pub observed_at: Instant,
+    pub received_at: Instant,
     pub best_bid: f64,
     pub best_ask: f64,
     pub latency_ms: u64,
@@ -48,6 +56,8 @@ fn parse_binance_ticker(
     payload: &str,
     config: &NetworkConfig,
     received_at_ms: u64,
+    received_at: Instant,
+    sequence: u64,
 ) -> Option<BinanceTicker> {
     let raw: BinanceTickerPayload = serde_json::from_str(payload).ok()?;
     if raw.event_type != "24hrTicker"
@@ -73,10 +83,16 @@ fn parse_binance_ticker(
         return None;
     }
 
+    let latency_ms = received_at_ms.saturating_sub(raw.event_time_ms);
     Some(BinanceTicker {
+        sequence,
+        observed_at: received_at
+            .checked_sub(Duration::from_millis(latency_ms))
+            .unwrap_or(received_at),
+        received_at,
         best_bid: bid,
         best_ask: ask,
-        latency_ms: received_at_ms.saturating_sub(raw.event_time_ms),
+        latency_ms,
     })
 }
 
@@ -84,6 +100,7 @@ pub async fn run_binance(config: NetworkConfig, sender: watch::Sender<Option<Bin
     let tls = native_tls::TlsConnector::new().expect("TLS init failed");
     let connector = Connector::NativeTls(tls);
     let mut backoff = 1;
+    let mut sequence = 0;
 
     loop {
         let cfg: Option<WebSocketConfig> = None;
@@ -97,11 +114,16 @@ pub async fn run_binance(config: NetworkConfig, sender: watch::Sender<Option<Bin
                     let Ok(text) = msg.into_text() else {
                         continue;
                     };
+                    let received_at = Instant::now();
                     let now_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    if let Some(ticker) = parse_binance_ticker(&text, &config, now_ms) {
+                    let next_sequence = sequence + 1;
+                    if let Some(ticker) =
+                        parse_binance_ticker(&text, &config, now_ms, received_at, next_sequence)
+                    {
+                        sequence = next_sequence;
                         let _ = sender.send(Some(ticker));
                     } else {
                         sender.send_if_modified(|current| current.take().is_some());
@@ -158,8 +180,11 @@ fn sqrt_price_x96_to_eth_usdc(hex: &str, config: &ChainConfig) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use tokio::time::Instant;
 
-    use super::{parse_binance_ticker, parse_rpc_response, sqrt_price_x96_to_eth_usdc};
+    use super::{
+        gas_gwei_from_rpc, parse_binance_ticker, parse_rpc_response, sqrt_price_x96_to_eth_usdc,
+    };
     use crate::config::{ChainConfig, NetworkConfig, PoolToken};
 
     const VALID_SLOT0_RESPONSE: &str = concat!(
@@ -210,6 +235,8 @@ mod tests {
             r#"{"e":"24hrTicker","E":900,"s":"ETHUSDC","b":"2499.25","B":"1.5","a":"2500.75","A":"2.5"}"#,
             &binance_config(),
             1_000,
+            Instant::now(),
+            1,
         )
         .expect("matching ticker");
 
@@ -226,7 +253,7 @@ mod tests {
                 r#"{{"e":"24hrTicker","E":900,"s":"{symbol}","b":"2499.25","B":"1.5","a":"2500.75","A":"2.5"}}"#
             );
 
-            assert!(parse_binance_ticker(&payload, &config, 1_000).is_none());
+            assert!(parse_binance_ticker(&payload, &config, 1_000, Instant::now(), 1).is_none());
         }
     }
 
@@ -243,7 +270,7 @@ mod tests {
             r#"{"e":"bookTicker","E":900,"s":"ETHUSDC","b":"2499.25","B":"1.5","a":"2500.75","A":"2.5"}"#,
             r#"{"e":"24hrTicker","s":"ETHUSDC","b":"2499.25","B":"1.5","a":"2500.75","A":"2.5"}"#,
         ] {
-            assert!(parse_binance_ticker(payload, &config, 1_000).is_none());
+            assert!(parse_binance_ticker(payload, &config, 1_000, Instant::now(), 1).is_none());
         }
     }
 
@@ -306,6 +333,29 @@ mod tests {
             assert!(parse_rpc_response(payload).is_err());
         }
     }
+
+    #[test]
+    fn rejects_failed_or_malformed_gas_prices_instead_of_fabricating_one() {
+        assert!(gas_gwei_from_rpc(Err(anyhow::anyhow!("RPC failed"))).is_err());
+        for value in [
+            json!(null),
+            json!(""),
+            json!("0x"),
+            json!("20"),
+            json!(-1),
+            json!("0x0"),
+            json!("0x00"),
+            json!("0x01"),
+            json!("0x04a817c800"),
+        ] {
+            assert!(gas_gwei_from_rpc(Ok((value, 1))).is_err());
+        }
+
+        assert_eq!(
+            gas_gwei_from_rpc(Ok((json!("0x4a817c800"), 1))).expect("valid gas price"),
+            20.0
+        );
+    }
 }
 
 fn parse_rpc_response(body: &str) -> anyhow::Result<Value> {
@@ -330,6 +380,26 @@ fn decode_rpc_quantity(value: &Value, field: &str) -> anyhow::Result<u64> {
         .filter(|data| !data.is_empty() && data.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .with_context(|| format!("{field} is not a hex quantity"))?;
     u64::from_str_radix(data, 16).with_context(|| format!("{field} exceeds u64"))
+}
+
+fn gas_gwei_from_rpc(result: anyhow::Result<(Value, u64)>) -> anyhow::Result<f64> {
+    let (value, _) = result?;
+    let encoded = value
+        .as_str()
+        .context("eth_gasPrice is not a hex quantity")?;
+    let data = encoded
+        .strip_prefix("0x")
+        .filter(|data| !data.is_empty() && data.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .context("eth_gasPrice is not a hex quantity")?;
+    if data.len() > 1 && data.starts_with('0') {
+        bail!("eth_gasPrice is not a canonical hex quantity");
+    }
+
+    let wei = decode_rpc_quantity(&value, "eth_gasPrice")?;
+    if wei == 0 {
+        bail!("eth_gasPrice must be greater than zero");
+    }
+    Ok(wei as f64 / 1e9)
 }
 
 fn decode_abi_u64(value: &Value, field: &str) -> anyhow::Result<u64> {
@@ -506,8 +576,11 @@ async fn verify_chain_config(client: &reqwest::Client, config: &ChainConfig) -> 
 
 // ── Public types & poller ─────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ChainData {
+    pub sequence: u64,
+    pub observed_at: Instant,
+    pub received_at: Instant,
     pub dex_price: f64,
     pub gas_gwei: f64,
     pub rpc_latency_ms: u64,
@@ -518,6 +591,8 @@ pub async fn run_chain_poller(
     config: ChainConfig,
     sender: watch::Sender<Option<ChainData>>,
 ) {
+    let mut sequence = 0;
+
     loop {
         match verify_chain_config(&client, &config).await {
             Ok(()) => break,
@@ -533,6 +608,7 @@ pub async fn run_chain_poller(
     }
 
     loop {
+        let poll_started = Instant::now();
         let p_params = json!([{"to": &config.pool_address, "data": SLOT0_SELECTOR}, "latest"]);
         let g_params = json!([]);
 
@@ -541,47 +617,50 @@ pub async fn run_chain_poller(
             rpc_call(&client, &config.rpc_url, "eth_gasPrice", g_params)
         );
 
-        let (price, price_rtt) = match p_res {
-            Ok((value, rtt)) => match value
+        let price = match p_res {
+            Ok((value, _)) => match value
                 .as_str()
                 .and_then(|value| sqrt_price_x96_to_eth_usdc(value, &config))
             {
-                Some(price) => (price, rtt),
+                Some(price) => price,
                 None => {
                     warn!("Invalid eth_call slot0 result; skipping DEX observation");
                     sender.send_if_modified(|current| current.take().is_some());
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(CHAIN_POLL_CADENCE).await;
                     continue;
                 }
             },
             Err(error) => {
                 warn!("eth_call failed; skipping DEX observation: {error}");
                 sender.send_if_modified(|current| current.take().is_some());
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(CHAIN_POLL_CADENCE).await;
                 continue;
             }
         };
 
-        let (gas, gas_rtt) = match g_res {
-            Ok((value, rtt)) => (
-                value
-                    .as_str()
-                    .and_then(|hex| u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok())
-                    .map(|wei| wei as f64 / 1e9)
-                    .unwrap_or(20.0),
-                rtt,
-            ),
+        let gas = match gas_gwei_from_rpc(g_res) {
+            Ok(gas) => gas,
             Err(error) => {
-                warn!("eth_gasPrice failed; using fallback gas price: {error}");
-                (20.0, price_rtt)
+                warn!("eth_gasPrice failed or was malformed; skipping chain observation: {error}");
+                sender.send_if_modified(|current| current.take().is_some());
+                tokio::time::sleep(CHAIN_POLL_CADENCE).await;
+                continue;
             }
         };
 
+        sequence += 1;
+        let received_at = Instant::now();
         let _ = sender.send(Some(ChainData {
+            sequence,
+            observed_at: poll_started,
+            received_at,
             dex_price: price,
             gas_gwei: gas,
-            rpc_latency_ms: (price_rtt + gas_rtt) / 2,
+            rpc_latency_ms: received_at
+                .duration_since(poll_started)
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
         }));
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(CHAIN_POLL_CADENCE).await;
     }
 }
