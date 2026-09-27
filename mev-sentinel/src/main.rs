@@ -27,7 +27,9 @@ use tracing_subscriber::FmtSubscriber;
 use aggregation::run_aggregation;
 use config::Config;
 use engine::QuantEngine;
-use network::{run_binance, run_chain_poller, BinanceTicker, ChainData};
+use network::{
+    build_rpc_client, run_binance, run_chain_poller, BinanceTicker, ChainData, RPC_REQUEST_TIMEOUT,
+};
 use ui::UiState;
 
 #[derive(Debug, Clone, Copy)]
@@ -76,12 +78,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ── Connection Pooling ────────────────────────────────────────────────
-    let tls = native_tls::TlsConnector::new().expect("TLS init failed");
-    let client = reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
-        .pool_max_idle_per_host(5)
-        .build()
-        .expect("HTTP client build failed");
+    let client = build_rpc_client(RPC_REQUEST_TIMEOUT).expect("HTTP client build failed");
 
     // ── TUI Setup ─────────────────────────────────────────────────────────
     enable_raw_mode()?;

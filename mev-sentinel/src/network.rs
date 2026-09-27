@@ -22,6 +22,26 @@ const DECIMALS_SELECTOR: &str = "0x313ce567";
 pub const BINANCE_TICKER_CADENCE: Duration = Duration::from_secs(1);
 pub const CHAIN_POLL_CADENCE: Duration = Duration::from_secs(2);
 
+/// Upper bound for any single RPC HTTP exchange.
+///
+/// Every chain RPC method is a fast single-shot read; anything slower is a
+/// stuck connection that must never stall the poll loop indefinitely.
+pub const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Build the shared RPC HTTP client.
+///
+/// Single wiring point for all `rpc_call` traffic: connection pooling, TLS
+/// and the request timeout live here so production and tests observe the
+/// same contract.
+pub fn build_rpc_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+    let tls = native_tls::TlsConnector::new().expect("TLS init failed");
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .pool_max_idle_per_host(5)
+        .timeout(timeout)
+        .build()
+}
+
 // ── Binance WebSocket ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
@@ -180,10 +200,12 @@ fn sqrt_price_x96_to_eth_usdc(hex: &str, config: &ChainConfig) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use std::time::Duration;
     use tokio::time::Instant;
 
     use super::{
-        gas_gwei_from_rpc, parse_binance_ticker, parse_rpc_response, sqrt_price_x96_to_eth_usdc,
+        build_rpc_client, gas_gwei_from_rpc, parse_binance_ticker, parse_rpc_response, rpc_call,
+        sqrt_price_x96_to_eth_usdc,
     };
     use crate::config::{ChainConfig, NetworkConfig, PoolToken};
 
@@ -354,6 +376,47 @@ mod tests {
         assert_eq!(
             gas_gwei_from_rpc(Ok((json!("0x4a817c800"), 1))).expect("valid gas price"),
             20.0
+        );
+    }
+
+    #[test]
+    fn rpc_request_times_out_against_silent_server() {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind hanging fixture");
+        let port = listener.local_addr().expect("fixture port").port();
+        std::thread::spawn(move || {
+            // Hold one accepted connection open without ever responding:
+            // simulates a hung RPC endpoint with zero external dependencies.
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+
+        // Same constructor production uses: the timeout under test is the
+        // wired contract, not a test-local setting.
+        let client = build_rpc_client(Duration::from_secs(1)).expect("fixture client");
+        let url = format!("http://127.0.0.1:{port}");
+        let started = Instant::now();
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture runtime")
+            .block_on(async { rpc_call(&client, &url, "eth_call", json!([])).await });
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("silent server must not produce a response");
+        assert!(
+            err.downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout),
+            "expected a reqwest timeout error, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "request must be bounded by the client timeout, took {elapsed:?}"
         );
     }
 }
